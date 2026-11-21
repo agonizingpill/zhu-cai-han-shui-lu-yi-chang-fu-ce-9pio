@@ -12,13 +12,28 @@
 
 - 竹材入库 `BambooLot`：批次号、产地、采伐日、树种、毛重与目标含水率。
 - 含水率采样 `MoistureSample`：每个点位只能录入一次，少于 4 点时禁止建模。
-- 异常批次 `AnomalyLot`：持久化 OneClassSVM 判定、标准化距离、模型 checksum 和隔离状态。
+- 异常批次 `AnomalyLot`：持久化判定结论、均值/最大值、版本 checksum 和隔离状态。
 - 窑干复测 `KilnRecheck`：记录窑位时间窗，冲突时创建 `RESCHEDULED` 版本并保留原排程。
 - 出库放行 `ReleaseDecision`：只有 supervisor 能盖章，异常复测未闭环时后端拒绝放行。
+- 参考批次版本 `ReferenceVersion`：每版基准带高湿阈值与参考批次成员，同一时刻只有一个 `ACTIVE`，版本状态走 `DRAFT → CANDIDATE → ACTIVE/ARCHIVED`。
+- 留样 `RetainedSample`：独立于训练集，带人工判定 `NORMAL/HIGH`；留样禁止进入任何参考版本。
+- 对照跑 `ComparisonRun`：基准版与候选版用**同一组留样**对照，读数与人工判定在开跑瞬间快照固定；中断可续跑，只重算未完成项。
+- 发布闸门与回滚 `BaselineRelease`：候选必须**误报更少且不新增漏报**才能发布；闸门拦截记 `REJECTED`，切换异常记 `ROLLED_BACK` 且旧版保持 `ACTIVE`。
 
-## 算法口径
+## 参考批次切换流程（发布闸门）
 
-worker 从 Redis 队列读取分析任务，将每个批次的测点压缩为 `[均值, 标准差, 最小值, 最大值]`，用无异常单的已采样批次拟合 `StandardScaler`，再训练固定参数的 `OneClassSVM(kernel=rbf, gamma=scale, nu=0.2)`。当前批次标准化距离为 `||x_scaled||₂`，`prediction=-1` 或距离不小于 `2.25` 时进入异常隔离。固定种子为 `1075`。结果写入 `analysis_jobs` 和 `anomaly_lots`。
+1. 主管登记留样与人工判定（留样不参与任何训练）。
+2. 主管创建候选参考版本并标记 `CANDIDATE`。
+3. 主管发起对照跑：系统对全部留样固化读数 + 人工判定快照，向 worker 投递对照任务，两版基准各判一次。
+4. worker 逐项写入 `comparison_items`；中途失败可在页面点“续跑”，已完成项不重算。
+5. 全部完成后按混淆矩阵计算闸门：误报(FP)=判 HIGH 人工 NORMAL，漏报(FN)=判 NORMAL 人工 HIGH。仅当 `候选 FP < 基准 FP` 且 `候选 FN ≤ 基准 FN` 时 `gate_passed=true`。
+6. 主管点“发布切换”：闸门不过则记 `REJECTED` 且旧版不变；通过则在单事务内归档旧版、激活候选。切换中任何异常整体回滚并独立记录 `ROLLED_BACK`，旧版保持 `ACTIVE`。
+7. 版本切换对在途初检的影响：切换前已被 worker 领走（`RUNNING`）的初检按旧版跑完；仍在 `QUEUED` 且未锚定的排队任务改跟新版。每张初检单 `analysis_jobs.reference_version_id` 都记录实际使用版本，可在“基准对照”页回溯。
+
+## 判定口径
+
+判定引擎 `backend/src/services/moisture_engine.py` 为纯标准库实现，backend 与 worker 共用同一份代码（worker 镜像内置副本）。按参考版本的高湿阈值，对一组测点读数计算 `mean/std/min/max`，均值或任一测点越过阈值即判 `HIGH`，并生成 16 位 checksum 保证结果可回溯、确定性可复现。发布闸门的混淆矩阵与判定逻辑同样集中在该模块，单元测试直接覆盖。
+
 
 ## 快速启动
 
@@ -52,7 +67,18 @@ docker compose up -d --build
 | db | PostgreSQL 16 |
 | queue | Redis 7 |
 
-领域代码位于 `backend/src/main.py`、`backend/src/services/moisture_ml.py`、`backend/src/models/schema.sql` 和 `frontend/src/app.js`。seed 位于 `backend/scripts/seed_demo.py`。
+领域代码位于 `backend/src/main.py`、`backend/src/services/baseline.py`、`backend/src/services/moisture_engine.py`、`backend/src/models/schema.sql` 和 `frontend/src/app.js`。seed 位于 `backend/scripts/seed_demo.py`，预置 8 个普通参考批次、10 个留样（含 2 个高湿）与三版基准（V1 生效 / V2 可过闸门 / V3 演示漏报被拦截）。
+
+## 单元与业务流测试
+
+测试不依赖 Postgres/Redis，纯标准库即可运行：
+
+```bash
+python3 -I -m unittest discover -s backend/tests -v
+```
+
+- `test_moisture_engine.py`：判定确定性、阈值口径、发布闸门（少误报、无新增漏报、误报持平不放行、混淆矩阵）。
+- `test_baseline_flow.py`：用内存假库端到端验证开跑快照、中断续跑幂等、闸门拦截保旧版、切换失败回滚、在途/排队初检的版本归属。
 
 ## License
 

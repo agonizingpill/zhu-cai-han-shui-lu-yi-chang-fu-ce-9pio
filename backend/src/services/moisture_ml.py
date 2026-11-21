@@ -1,3 +1,8 @@
+"""[已弃用] 早期 OneClassSVM 判定实现，保留仅作历史参考。
+
+当前判定口径统一以 moisture_engine.judge 为准（版本化高湿阈值 + checksum），
+worker 与 backend 均不再引用本模块，请勿在新流程中使用。
+"""
 import hashlib,json,numpy as np
 from sklearn.preprocessing import StandardScaler
 from sklearn.svm import OneClassSVM

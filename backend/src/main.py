@@ -7,6 +7,7 @@ from .utils.db import conn, one, all_rows
 from .utils.security import hp, token, user, roles
 from .config.settings import MIN_SAMPLE_POINTS
 from .services.queue import put
+from .services import baseline
 from .middlewares.audit import AuditMiddleware
 from .middlewares.rate_limit import RateLimitMiddleware
 
@@ -21,6 +22,16 @@ class SampleIn(BaseModel): point_code:str; moisture_pct:float=Field(ge=0,le=100)
 class ScheduleIn(BaseModel): kiln_code:str; scheduled_start:str; scheduled_end:str
 class ResultIn(BaseModel): post_moisture:float=Field(ge=0,le=100); result:str; notes:str=''
 class ReleaseIn(BaseModel): decision:str; reason:str
+class VersionIn(BaseModel): version_code:str; description:str=''; high_moisture_threshold:float=Field(gt=0,lt=100); member_lot_ids:list[int]=Field(min_length=1)
+class RetainedIn(BaseModel): lot_id:int; manual_verdict:str; note:str=''
+class RunIn(BaseModel): run_code:str; baseline_version_id:int; candidate_version_id:int
+
+def _guard(e):
+    msg=str(e)
+    if isinstance(e,LookupError): raise HTTPException(404,msg)
+    if isinstance(e,PermissionError): raise HTTPException(409,msg)
+    if isinstance(e,ValueError): raise HTTPException(400,msg)
+    raise e
 
 def detail(lot_id):
     l=one('SELECT * FROM bamboo_lots WHERE id=%s',(lot_id,))
@@ -52,7 +63,10 @@ def login(d:Login):
 
 @app.get('/dashboard')
 def dashboard(u=Depends(roles('operator','supervisor','viewer'))):
-    return {'lots':one('SELECT count(*) n FROM bamboo_lots')['n'],'sampled':one("SELECT count(*) n FROM bamboo_lots WHERE status<>'RECEIVED'")['n'],'open_anomalies':one("SELECT count(*) n FROM anomaly_lots WHERE status IN ('OPEN','SCHEDULED','RECHECKING')")['n'],'pending_release':one("SELECT count(*) n FROM bamboo_lots WHERE status='CLEARED'")['n']}
+    active=baseline.active_version()
+    return {'lots':one('SELECT count(*) n FROM bamboo_lots')['n'],'sampled':one("SELECT count(*) n FROM bamboo_lots WHERE status<>'RECEIVED'")['n'],'open_anomalies':one("SELECT count(*) n FROM anomaly_lots WHERE status IN ('OPEN','SCHEDULED','RECHECKING')")['n'],'pending_release':one("SELECT count(*) n FROM bamboo_lots WHERE status='CLEARED'")['n'],
+            'retained_samples':one("SELECT count(*) n FROM retained_samples")['n'],
+            'active_reference_version':{'id':active['id'],'version_code':active['version_code'],'high_moisture_threshold':float(active['high_moisture_threshold'])} if active else None}
 
 @app.get('/lots')
 def lots(u=Depends(roles('operator','supervisor','viewer'))):
@@ -92,11 +106,14 @@ def sample(lot_id:int,d:SampleIn,u=Depends(roles('operator','supervisor'))):
 def analyze(lot_id:int,u=Depends(roles('operator','supervisor'))):
     d=detail(lot_id); n=len(d['samples'])
     if n<MIN_SAMPLE_POINTS: raise HTTPException(409,f'采样点不足，至少需要 {MIN_SAMPLE_POINTS} 个测点，当前 {n} 个')
+    active=baseline.active_version()
+    if not active: raise HTTPException(409,'尚无生效参考版本，无法初检')
     with conn() as c:
         with c.cursor() as cur:
-            cur.execute('INSERT INTO analysis_jobs(lot_id,input_summary) VALUES(%s,%s) RETURNING id',(lot_id,json.dumps({'sample_count':n,'points':[s['point_code'] for s in d['samples']]})))
+            # 排队任务先锚定当前生效版本；切换发生时未领走的排队任务会改跟新版
+            cur.execute('INSERT INTO analysis_jobs(lot_id,input_summary,reference_version_id) VALUES(%s,%s,%s) RETURNING id',(lot_id,json.dumps({'sample_count':n,'points':[s['point_code'] for s in d['samples']]}),active['id']))
             jid=cur.fetchone()[0]
-    put(jid); return {'job_id':jid,'status':'QUEUED'}
+    put(jid); return {'job_id':jid,'status':'QUEUED','reference_version_id':active['id'],'reference_version_code':active['version_code']}
 
 @app.get('/anomalies')
 def anomalies(u=Depends(roles('operator','supervisor','viewer'))):
@@ -144,3 +161,73 @@ def release(lot_id:int,d:ReleaseIn,u=Depends(roles('supervisor'))):
             cur.execute('INSERT INTO release_decisions(lot_id,anomaly_id,decision,reason,decided_by) VALUES(%s,%s,%s,%s,%s)',(lot_id,a['id'] if a else None,d.decision,d.reason,u['id']))
             cur.execute("UPDATE bamboo_lots SET status=%s WHERE id=%s",('RELEASED' if d.decision=='RELEASE' else 'QUARANTINED',lot_id))
     return {'lot_id':lot_id,'decision':d.decision}
+
+# ---------- 参考批次版本 ----------
+@app.get('/reference-versions')
+def get_versions(u=Depends(roles('operator','supervisor','viewer'))): return baseline.list_versions()
+
+@app.get('/reference-versions/{version_id}')
+def get_version(version_id:int,u=Depends(roles('operator','supervisor','viewer'))):
+    v=baseline.get_version(version_id)
+    if not v: raise HTTPException(404,'参考版本不存在')
+    return v
+
+@app.post('/reference-versions')
+def create_version(d:VersionIn,u=Depends(roles('supervisor'))):
+    try: return baseline.create_version(d.version_code,d.description,d.high_moisture_threshold,d.member_lot_ids,u['id'])
+    except Exception as e: _guard(e)
+
+@app.post('/reference-versions/{version_id}/candidate')
+def mark_candidate(version_id:int,u=Depends(roles('supervisor'))):
+    try: baseline.mark_candidate(version_id); return baseline.get_version(version_id)
+    except Exception as e: _guard(e)
+
+# ---------- 留样 ----------
+@app.get('/retained-samples')
+def get_retained(u=Depends(roles('operator','supervisor','viewer'))): return baseline.list_retained()
+
+@app.post('/retained-samples')
+def register_retained(d:RetainedIn,u=Depends(roles('operator','supervisor'))):
+    if d.manual_verdict not in ('NORMAL','HIGH'): raise HTTPException(400,'人工判定只能是 NORMAL 或 HIGH')
+    try: baseline.register_retained(d.lot_id,d.manual_verdict,d.note); return {'ok':True}
+    except Exception as e: _guard(e)
+
+# ---------- 对照跑 ----------
+@app.get('/comparison-runs')
+def get_runs(u=Depends(roles('operator','supervisor','viewer'))): return baseline.list_runs()
+
+@app.get('/comparison-runs/{run_id}')
+def get_run(run_id:int,u=Depends(roles('operator','supervisor','viewer'))):
+    r=baseline.get_run(run_id)
+    if not r: raise HTTPException(404,'对照跑不存在')
+    return r
+
+@app.post('/comparison-runs')
+def start_run(d:RunIn,u=Depends(roles('supervisor'))):
+    try: return baseline.start_run(d.run_code,d.baseline_version_id,d.candidate_version_id,u['id'])
+    except Exception as e: _guard(e)
+
+@app.post('/comparison-runs/{run_id}/resume')
+def resume_run(run_id:int,u=Depends(roles('operator','supervisor'))):
+    try: return baseline.resume_run(run_id)
+    except Exception as e: _guard(e)
+
+# ---------- 发布切换（仅主管） ----------
+@app.get('/baseline-releases')
+def get_baseline_releases(u=Depends(roles('operator','supervisor','viewer'))): return baseline.list_releases()
+
+@app.post('/comparison-runs/{run_id}/publish')
+def publish(run_id:int,u=Depends(roles('supervisor'))):
+    try: return baseline.release_candidate(run_id,u['id'])
+    except Exception as e: _guard(e)
+
+@app.get('/initial-inspections')
+def initial_inspections(u=Depends(roles('operator','supervisor','viewer'))):
+    # 初检结果记下实际使用的参考版本，便于回溯“这一单按哪版基准判的”
+    return [dict(x) for x in all_rows(
+        """SELECT j.id,j.lot_id,j.status,j.error,j.created_at,j.claimed_at,j.finished_at,j.reference_version_id,
+                  v.version_code, v.high_moisture_threshold, l.lot_code
+           FROM analysis_jobs j
+           JOIN bamboo_lots l ON l.id=j.lot_id
+           LEFT JOIN reference_versions v ON v.id=j.reference_version_id
+           ORDER BY j.id DESC""")]
